@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib import transforms as mtransforms
 
 from lppls_tc_mpl_extension import FitConstraints, LPPLSModifiedTC
 
@@ -16,7 +17,7 @@ from lppls_tc_mpl_extension import FitConstraints, LPPLSModifiedTC
 # =========================
 # Paths and core settings
 # =========================
-DATA_FILE_PATH = Path(r"F:\Data\XAGUSD\xagusd_30s_all.csv")
+DATA_FILE_PATH = Path(__file__).resolve().parent / "data" / "sample_xagusd_2h.csv"
 OUTPUT_DIR_NAME = "lppls_lib_output_2016_backtest"
 
 SCAN_PROFILE = "bull_year"  # "crash_local" | "bull_year"
@@ -427,6 +428,28 @@ def build_fit_cache_entry(surface: pd.DataFrame, row: dict[str, Any]) -> list[di
     return select_diverse_omega_surface_fits(surface, row, max_curves=5)
 
 
+def build_interval_cache_entry(intervals: pd.DataFrame, row: dict[str, Any]) -> list[dict[str, Any]]:
+    if intervals.empty:
+        return []
+    if not bool(row.get("is_high_confidence")):
+        return []
+    if not bool(row.get("has_scenario")):
+        return []
+
+    lo_time = pd.Timestamp(row["interval_lo_time"])
+    hi_time = pd.Timestamp(row["interval_hi_time"])
+    overlap = intervals[
+        (intervals["interval_hi_time"] >= lo_time)
+        & (intervals["interval_lo_time"] <= hi_time)
+    ].copy()
+    if overlap.empty:
+        return []
+
+    overlap = overlap.sort_values(["window_size", "peak_rm"], ascending=[True, False])
+    chosen = overlap.groupby("window_size", as_index=False).first()
+    return chosen.sort_values("window_size").to_dict("records")
+
+
 def validate_prediction_row(close: pd.Series, row: pd.Series) -> pd.Series:
     out = row.copy()
     if not bool(row["has_scenario"]) or pd.isna(row["interval_hi_time"]):
@@ -556,7 +579,13 @@ def estimate_backtest_workload(
     return total_windows, total_fits
 
 
-def run_backtest(close: pd.Series) -> tuple[pd.DataFrame, dict[pd.Timestamp, list[dict[str, Any]]]]:
+def run_backtest(
+    close: pd.Series,
+) -> tuple[
+    pd.DataFrame,
+    dict[pd.Timestamp, list[dict[str, Any]]],
+    dict[pd.Timestamp, list[dict[str, Any]]],
+]:
     observations = build_observations(close)
     model = LPPLSModifiedTC(observations=observations)
     full_window_sizes = build_window_sizes(close)
@@ -579,6 +608,7 @@ def run_backtest(close: pd.Series) -> tuple[pd.DataFrame, dict[pd.Timestamp, lis
 
     rows: list[dict[str, Any]] = []
     fit_cache: dict[pd.Timestamp, list[dict[str, Any]]] = {}
+    interval_cache: dict[pd.Timestamp, list[dict[str, Any]]] = {}
     total = len(analysis_indices)
     for pos, t2_index in enumerate(analysis_indices, start=1):
         t2_time = close.index[t2_index]
@@ -605,6 +635,9 @@ def run_backtest(close: pd.Series) -> tuple[pd.DataFrame, dict[pd.Timestamp, lis
         cached_fits = build_fit_cache_entry(result["surface"], primary)
         if len(cached_fits):
             fit_cache[pd.Timestamp(t2_time)] = cached_fits
+        cached_intervals = build_interval_cache_entry(result["intervals"], primary)
+        if len(cached_intervals):
+            interval_cache[pd.Timestamp(t2_time)] = cached_intervals
 
         if pos == 1 or pos % 10 == 0 or pos == total:
             print(
@@ -616,7 +649,7 @@ def run_backtest(close: pd.Series) -> tuple[pd.DataFrame, dict[pd.Timestamp, lis
     state_df = pd.DataFrame(rows).set_index("t2_time").sort_index()
     if len(state_df):
         state_df = validate_prediction_rows(close, state_df)
-    return state_df, fit_cache
+    return state_df, fit_cache, interval_cache
 
 
 def format_timestamp(value: Any) -> str:
@@ -690,6 +723,7 @@ def plot_backtest_overview(
     state_df: pd.DataFrame,
     zone_df: pd.DataFrame,
     fit_cache: dict[pd.Timestamp, list[dict[str, Any]]],
+    interval_cache: dict[pd.Timestamp, list[dict[str, Any]]],
     out_path: Path,
 ) -> None:
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=PLOT_FIGSIZE, sharex=True, height_ratios=[3.0, 1.2])
@@ -802,6 +836,7 @@ def plot_backtest_overview(
         fontsize=8,
     )
     fit_annot.set_visible(False)
+    xaxis_axes_transform = mtransforms.blended_transform_factory(ax1.transData, ax1.transAxes)
 
     active_artists: list[Any] = []
     active_fit_artists: list[Any] = []
@@ -840,11 +875,44 @@ def plot_backtest_overview(
         lo_time = pd.Timestamp(row["interval_lo_time"])
         hi_time = pd.Timestamp(row["interval_hi_time"])
         peak_time = pd.Timestamp(row["peak_tc_time"])
+        signal_time = pd.Timestamp(row["t2_time"])
         color = "#ef4444"
         active_artists.append(ax1.axvspan(lo_time, hi_time, color=color, alpha=0.10, zorder=1))
         active_artists.append(ax2.axvspan(lo_time, hi_time, color=color, alpha=0.08, zorder=1))
         active_artists.append(ax1.axvline(peak_time, color=color, linestyle="--", linewidth=1.1, alpha=0.9, zorder=7))
         active_artists.append(ax2.axvline(peak_time, color=color, linestyle="--", linewidth=1.1, alpha=0.9, zorder=7))
+
+        raw_intervals = interval_cache.get(signal_time, [])
+        if len(raw_intervals) == 0:
+            return
+
+        interval_colors = plt.cm.Blues(np.linspace(0.45, 0.88, max(len(raw_intervals), 1)))
+        usable_height = 0.22
+        step = usable_height / max(len(raw_intervals), 1)
+        for idx, (interval_color, interval_row) in enumerate(zip(interval_colors, raw_intervals), start=1):
+            y_frac = 0.96 - (idx - 0.5) * step
+            line, = ax1.plot(
+                [pd.Timestamp(interval_row["interval_lo_time"]), pd.Timestamp(interval_row["interval_hi_time"])],
+                [y_frac, y_frac],
+                color=interval_color,
+                linewidth=2.0,
+                alpha=0.75,
+                transform=xaxis_axes_transform,
+                solid_capstyle="round",
+                zorder=8,
+            )
+            active_artists.append(line)
+            peak_dot = ax1.scatter(
+                [pd.Timestamp(interval_row["peak_tc_time"])],
+                [y_frac],
+                s=16,
+                color=interval_color,
+                edgecolors="white",
+                linewidths=0.4,
+                transform=xaxis_axes_transform,
+                zorder=9,
+            )
+            active_artists.append(peak_dot)
 
     def show_signal_fit_bundle(row: pd.Series) -> None:
         nonlocal active_signal_time
@@ -926,6 +994,7 @@ def plot_backtest_overview(
             f"          {format_timestamp(row['interval_hi_time'])}\n"
             f"horizon={format_float(row['horizon_days'], 1)}d  width={format_float(row['interval_width_days'], 1)}d\n"
             f"support={format_float(row['support_share'], 3)}  Rm={format_float(row['rm_max'], 3)}\n"
+            f"raw LI windows={len(interval_cache.get(pd.Timestamp(row['t2_time']), []))}\n"
             f"runup={format_float(100.0 * row['runup_pct'], 1)}%  push={format_float(100.0 * row['final_push_pct'], 1)}%\n"
             f"m={format_float(row['m'], 3)}  omega={format_float(row['omega'], 3)}  D={format_float(row['D'], 3)}"
         )
@@ -1086,7 +1155,8 @@ def print_plot_guide(zone_df: pd.DataFrame) -> None:
     print("  4. 橙色半透明竖向阴影：泡沫进入区。程序会将相邻的高置信度预测点合并成一个区间。")
     print("  5. 三角形：每个泡沫进入区的入场时点 entry_time。")
     print("  6. Z1、Z2、Z3：泡沫进入区编号 zone_id。标签写在各自区间的起点上方。")
-    print("  7. 悬停在绿色圆点上时，图中会显示该次预测的破裂区间 [interval_lo, interval_hi] 与 peak_tc。")
+    print("  7. 悬停在绿色圆点上时，图中会显示该次预测的聚合破裂区间 [interval_lo, interval_hi] 与 peak_tc。")
+    print("  8. 同一次悬停还会显示一排蓝色短条。每一条对应一个窗口的原始 LI(tc)，圆点是该窗口的 peak_tc。")
 
     if len(zone_df) == 0:
         print("\n当前没有进入高置信度泡沫区的区间。")
@@ -1122,7 +1192,7 @@ def main() -> None:
         f"horizon_pref={PREFERRED_HORIZON_DAYS[0]:.0f}..{PREFERRED_HORIZON_DAYS[1]:.0f}d"
     )
 
-    state_df, fit_cache = run_backtest(close)
+    state_df, fit_cache, interval_cache = run_backtest(close)
     median_bar_days = close.index.to_series().diff().dropna().dt.total_seconds().median() / 86400.0
     analysis_gap = pd.Timedelta(days=float(median_bar_days) * ANALYSIS_STEP_BARS)
     zone_df = build_bubble_zones(state_df, close, analysis_gap)
@@ -1133,7 +1203,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     state_df.to_csv(out_dir / "tc_backtest_states.csv", encoding="utf-8-sig")
     zone_df.to_csv(out_dir / "tc_backtest_zones.csv", encoding="utf-8-sig")
-    plot_backtest_overview(close, state_df, zone_df, fit_cache, out_dir / "01_tc_backtest_overview.png")
+    plot_backtest_overview(close, state_df, zone_df, fit_cache, interval_cache, out_dir / "01_tc_backtest_overview.png")
 
     print(f"\nOutput dir: {out_dir}")
     print("Generated: 01_tc_backtest_overview.png, tc_backtest_states.csv, tc_backtest_zones.csv")

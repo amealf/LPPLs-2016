@@ -10,7 +10,7 @@ from lppls import lppls
 # =========================
 # Paths and core settings
 # =========================
-DATA_FILE_PATH = Path(r"F:\Data\XAGUSD\xagusd_30s_all.csv")
+DATA_FILE_PATH = Path(__file__).resolve().parent / "data" / "sample_xagusd_2h.csv"
 OUTPUT_DIR_NAME = "lppls_lib_output"
 
 SCAN_PROFILE = "bull_year"  # "crash_local" | "bull_year"

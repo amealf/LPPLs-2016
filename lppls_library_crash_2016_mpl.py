@@ -13,7 +13,7 @@ from lppls_tc_mpl_extension import FitConstraints, LPPLSModifiedTC
 # =========================
 # Paths and scan settings
 # =========================
-DATA_FILE_PATH = Path(r"F:\Data\XAGUSD\xagusd_30s_all.csv")
+DATA_FILE_PATH = Path(__file__).resolve().parent / "data" / "sample_xagusd_2h.csv"
 OUTPUT_DIR_NAME = "lppls_lib_output"
 PREVIOUS_EVENTS_FILE_NAME = "lppls_prediction_events.csv"
 
