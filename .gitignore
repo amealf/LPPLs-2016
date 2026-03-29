@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+LPPL result/
+reports/
+_tmp_backtest_plot.png
+
+Data/*_all.csv
+!Data/*__1d.csv
+!Data/*__1h.csv
+!Data/*__2h.csv

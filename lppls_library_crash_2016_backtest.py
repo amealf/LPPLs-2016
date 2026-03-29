@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,15 +12,20 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib import transforms as mtransforms
 
-from lppls_tc_mpl_extension import FitConstraints, LPPLSModifiedTC
+from extension.lppls_tc_mpl_extension import FitConstraints, LPPLSModifiedTC
+from extension.resample_data import build_resampled_data_path
 
 
 # =========================
 # Paths and core settings
 # =========================
-DATA_FILE_PATH = Path(__file__).resolve().parent / "data" / "sample_xagusd_2h.csv"
-OUTPUT_DIR_NAME = "lppls_lib_output_2016_backtest"
+DATA_DIR = Path(__file__).resolve().parent / "Data"
+DATA_FILE_NAME = "xagusd_30s_all.csv"
+DATA_FILE_PATH = DATA_DIR / DATA_FILE_NAME
+START_DATE = "20241201"
+END_DATE = "" 
 
+RESULT_DIR_NAME = "LPPL result"
 SCAN_PROFILE = "bull_year"  # "crash_local" | "bull_year"
 BACKTEST_SPEED_MODE = "fast_validation"  # "fast_validation" | "full_scan"
 WORKERS = max(1, min(4, (os.cpu_count() or 1)))
@@ -29,10 +35,10 @@ if SCAN_PROFILE == "crash_local":
     WINDOW_SIZE_DAYS = 60.0
     SMALLEST_WINDOW_DAYS = 20.0
     OUTER_INCREMENT_DAYS = 2.0 if BACKTEST_SPEED_MODE == "fast_validation" else 1.0
-    TC_GRID_PAST_DAYS = 4.0 if BACKTEST_SPEED_MODE == "fast_validation" else 5.0
+    TC_GRID_PAST_DAYS = 0.0
     TC_GRID_FUTURE_DAYS = 18.0 if BACKTEST_SPEED_MODE == "fast_validation" else 25.0
     TC_GRID_STEP_DAYS = 0.5 if BACKTEST_SPEED_MODE == "fast_validation" else 0.25
-    PEAK_CUTOFF = 0.20
+    PEAK_CUTOFF = 0.20 
     ANALYSIS_STEP_BARS = 2 if BACKTEST_SPEED_MODE == "fast_validation" else 1
     MIN_HISTORY_DAYS = 25.0
     PREFERRED_HORIZON_DAYS = (2.0, 12.0)
@@ -50,11 +56,11 @@ else:
     WINDOW_SIZE_DAYS = 300.0
     SMALLEST_WINDOW_DAYS = 120.0
     OUTER_INCREMENT_DAYS = 14.0 if BACKTEST_SPEED_MODE == "fast_validation" else 7.0
-    TC_GRID_PAST_DAYS = 20.0 if BACKTEST_SPEED_MODE == "fast_validation" else 30.0
+    TC_GRID_PAST_DAYS = 0.0
     TC_GRID_FUTURE_DAYS = 90.0 if BACKTEST_SPEED_MODE == "fast_validation" else 150.0
     TC_GRID_STEP_DAYS = 1.0
     PEAK_CUTOFF = 0.20
-    ANALYSIS_STEP_BARS = 5 if BACKTEST_SPEED_MODE == "fast_validation" else 3
+    ANALYSIS_STEP_BARS = 3
     MIN_HISTORY_DAYS = 140.0
     PREFERRED_HORIZON_DAYS = (7.0, 45.0)
     MAX_HORIZON_DAYS = 90.0
@@ -83,6 +89,37 @@ FIT_CONSTRAINTS = FitConstraints(
     d_min=0.8,
     b_sign="negative",
 )
+
+
+def infer_symbol_name(file_path: Path) -> str:
+    tokens = [t for t in re.split(r"[_\-\s]+", file_path.stem.lower()) if t]
+    filtered = [t for t in tokens if t not in {"sample", "all", "data", "ohlcv"}]
+    if not filtered:
+        return "unknown"
+    if len(filtered) >= 2 and re.fullmatch(r"\d+[smhdw]", filtered[-1]):
+        filtered = filtered[:-1]
+    return filtered[0] if filtered else "unknown"
+
+
+def make_output_tag(close: pd.Series) -> str:
+    symbol = infer_symbol_name(Path(DATA_FILE_NAME))
+    start_text = pd.Timestamp(close.index.min()).strftime("%Y%m%d")
+    end_text = pd.Timestamp(close.index.max()).strftime("%Y%m%d")
+    return f"{symbol}_{start_text}_{end_text}"
+
+
+def resolve_input_data_path() -> tuple[Path, bool]:
+    converted_path = build_resampled_data_path(DATA_DIR, DATA_FILE_NAME, RESAMPLE_RULE)
+    if converted_path.exists():
+        return converted_path, True
+    return DATA_FILE_PATH, False
+
+
+def parse_date_yyyymmdd(text: str) -> pd.Timestamp | None:
+    text = str(text).strip()
+    if not text:
+        return None
+    return pd.Timestamp(pd.to_datetime(text, format="%Y%m%d"))
 
 
 def make_datetime_monotonic(dt: pd.Series, default_step_seconds: int = 30) -> pd.DatetimeIndex:
@@ -148,6 +185,20 @@ def read_ohlcv_file(file_path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"]).copy()
     df["datetime"] = make_datetime_monotonic(df["datetime"], default_step_seconds=30)
     return df.set_index("datetime").sort_index()
+
+
+def apply_date_range(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+    start_ts = parse_date_yyyymmdd(start_date)
+    end_ts = parse_date_yyyymmdd(end_date)
+
+    out = df
+    if start_ts is not None:
+        out = out.loc[out.index >= start_ts]
+    if end_ts is not None:
+        out = out.loc[out.index < end_ts + pd.Timedelta(days=1)]
+    if out.empty:
+        raise ValueError("No rows left after applying START_DATE and END_DATE.")
+    return out
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -1176,11 +1227,22 @@ def main() -> None:
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    print(f"Data file: {DATA_FILE_PATH}")
-    df_raw = read_ohlcv_file(DATA_FILE_PATH)
-    print(f"Raw rows: {len(df_raw):,d} | range: {df_raw.index.min()} ~ {df_raw.index.max()}")
+    input_path, using_converted = resolve_input_data_path()
+    print(f"Configured raw data file: {DATA_FILE_PATH}")
+    print(f"Resolved input file: {input_path}")
 
-    df = resample_ohlcv(df_raw, RESAMPLE_RULE)
+    df_loaded = read_ohlcv_file(input_path)
+    df_loaded = apply_date_range(df_loaded, START_DATE, END_DATE)
+
+    if using_converted:
+        print(f"Using converted data file for rule {RESAMPLE_RULE}.")
+        df = df_loaded
+        print(f"Converted rows: {len(df):,d} | range: {df.index.min()} ~ {df.index.max()}")
+    else:
+        print(f"Converted data file not found for rule {RESAMPLE_RULE}. Resampling raw data in memory.")
+        print(f"Raw rows: {len(df_loaded):,d} | range: {df_loaded.index.min()} ~ {df_loaded.index.max()}")
+        df = resample_ohlcv(df_loaded, RESAMPLE_RULE)
+
     close = df["close"].dropna().copy()
     print(
         f"Profile: {SCAN_PROFILE} | Resampled rule: {RESAMPLE_RULE} | "
@@ -1199,14 +1261,22 @@ def main() -> None:
     print_summary(state_df, zone_df)
     print_plot_guide(zone_df)
 
-    out_dir = DATA_FILE_PATH.parent / OUTPUT_DIR_NAME
+    program_name = Path(__file__).resolve().stem
+    out_dir = Path(__file__).resolve().parent / RESULT_DIR_NAME / program_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    state_df.to_csv(out_dir / "tc_backtest_states.csv", encoding="utf-8-sig")
-    zone_df.to_csv(out_dir / "tc_backtest_zones.csv", encoding="utf-8-sig")
-    plot_backtest_overview(close, state_df, zone_df, fit_cache, interval_cache, out_dir / "01_tc_backtest_overview.png")
+    output_tag = make_output_tag(close)
+    states_path = out_dir / f"tc_backtest_states_{output_tag}.csv"
+    zones_path = out_dir / f"tc_backtest_zones_{output_tag}.csv"
+    figure_path = out_dir / f"lppls_backtest_overview_{output_tag}.png"
+
+    state_df.to_csv(states_path, encoding="utf-8-sig")
+    zone_df.to_csv(zones_path, encoding="utf-8-sig")
+    plot_backtest_overview(close, state_df, zone_df, fit_cache, interval_cache, figure_path)
 
     print(f"\nOutput dir: {out_dir}")
-    print("Generated: 01_tc_backtest_overview.png, tc_backtest_states.csv, tc_backtest_zones.csv")
+    print(f"Generated figure: {figure_path.name}")
+    print(f"Generated states: {states_path.name}")
+    print(f"Generated zones: {zones_path.name}")
     plt.show()
 
 
